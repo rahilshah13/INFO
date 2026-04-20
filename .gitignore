@@ -1,1 +1,7 @@
-artifacts_volume
+/*
+!/artifacts_volume/
+!/info_txt_volume/
+!/src/
+!Dockerfile
+!README
+!verify_hashes.sh
