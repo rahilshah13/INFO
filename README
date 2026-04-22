@@ -1,3 +1,4 @@
+INFO is an untyped, eagerly evaluated, target-agnostic DSL for cloud-native software appliances 
 ### Retain the file structure, filenames, and coding conventions.
 ### artifacts_volume hash: ``
 ### TODO: Fix
