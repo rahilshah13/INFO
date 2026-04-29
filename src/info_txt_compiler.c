@@ -1,5 +1,6 @@
 // brew install libomp
 // clang -Xpreprocessor -fopenmp -lomp -I$(brew --prefix libomp)/include -L$(brew --prefix libomp)/lib info_txt_compiler.c -o info_txt_compiler
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,7 +10,6 @@
 #define IR(u, s, m) if(strstr(u, s)) printf(m)
 #define FLAG(n) (strcmp(argv[i], n) == 0)
 #define MAX_FILES 1024
-#define MAX_CONTENT 4096
 
 int main(int argc, char** argv) {
     int unsafe = 0, time = 0;
@@ -37,44 +37,56 @@ int main(int argc, char** argv) {
             
             FILE *f = fopen(path, "r");
             if (f) {
-                file_contents[file_count] = malloc(MAX_CONTENT);
-                if (fgets(file_contents[file_count], MAX_CONTENT, f)) {
-                    // Remove newline if exists
-                    file_contents[file_count][strcspn(file_contents[file_count], "\r\n")] = 0;
-                    file_count++;
-                }
+                fseek(f, 0, SEEK_END);
+                long fsize = ftell(f);
+                fseek(f, 0, SEEK_SET);
+
+                file_contents[file_count] = malloc(fsize + 1);
+                fread(file_contents[file_count], 1, fsize, f);
+                file_contents[file_count][fsize] = 0;
+                
                 fclose(f);
+                file_count++;
             }
         }
     }
-    
     closedir(dir);
+
     double start = omp_get_wtime();
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < file_count; i++) {
         int tid = omp_get_thread_num();
-        const char *current_line = file_contents[i];
+        char *saveptr;
+        // Spec: Closures are defined by 2 consecutive newlines
+        char *closure = strtok_r(file_contents[i], "\n\n", &saveptr);
 
-        if (!unsafe) {
-            for (const char *p = current_line; *p; p++) {
-                if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || strchr(" ->", *p))) {
-                    printf("[T%d] Invalid token in file %d: P%ld\n", tid, i, p - current_line);
-                    goto next;
+        while (closure != NULL) {
+            if (!unsafe) {
+                for (const char *p = closure; *p; p++) {
+                    // Allowed: alpha, numeric (precision), arrows, spaces, and hyphens (unit-alpha)
+                    if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || 
+                        (*p >= '0' && *p <= '9') || strchr(" ->\n-", *p))) {
+                        printf("[T%d] Lexical Error in file %d: Invalid token '%c'\n", tid, i, *p);
+                        goto next_closure;
+                    }
                 }
             }
-        }
 
-        printf("[T%d] IR %d: ", tid, i);
-        IR(current_line, "INCREMENT", "++ ");
-        IR(current_line, "DECREMENT", "-- ");
-        IR(current_line, "->", "-> ");
-        printf("[Eff: 1]\n");
-        next:;
+            printf("[T%d] IR (File %d): ", tid, i);
+            IR(closure, "INCREMENT", "++ ");
+            IR(closure, "DECREMENT", "-- ");
+            IR(closure, "->", "-> ");
+            printf("[Eff: 1]\n");
+
+            next_closure:
+            closure = strtok_r(NULL, "\n\n", &saveptr);
+        }
     }
 
     if (time) printf("Time: %fs\n", omp_get_wtime() - start);
-    printf("Linker: %s mem limit, %d files processed.\n", mem, file_count);
+    printf("Linker: %s mem limit, %d source volumes linked. .exe generated.\n", mem, file_count);
+    
     for(int i = 0; i < file_count; i++) free(file_contents[i]);
     return 0;
 }
