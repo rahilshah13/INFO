@@ -4,3 +4,11 @@ INFO is an untyped, target-agnostic DSL for cloud-native software appliances.
 ### TODO: Fix
 ### TODO: Add INFO.txt source code to `./info_txt_volume`
 ### TODO: Add INFO.txt "hello world" demo to `./artifacts_volume`
+
+### INFO Tenets 
+1. Log INFO
+2. Compile INFO
+3. Link INFO
+4. Compose INFO
+5. Index INFO
+6. Share INFO
