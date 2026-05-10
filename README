@@ -1,8 +1,7 @@
 INFO is an untyped programming language for cloud-native runtime environments.
 
-### Retain the directory structure, filenames, and coding conventions.
+### Adhere to `.gitignore` re-inclusion patterns.
 ### TODO: Fix
-### TODO: Add INFO.txt 'hello world' source code to `./info_txt_volume`
 
 ### INFO Tenets 
 1. Log INFO
