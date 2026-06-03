@@ -6,7 +6,6 @@ INFO is an untyped programming language for cloud-native runtime environments.
 ### INFO Tenets 
 1. Log INFO
 2. Compile INFO
+3. Index INFO
 3. Link INFO
-4. Compose INFO
-5. Index INFO
-6. Share INFO
+4. Execute INFO
