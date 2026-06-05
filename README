@@ -1,4 +1,4 @@
-INFO is an untyped programming language for cloud-native runtime environments.
+INFO is an untyped programming language that targets signed-32-bit-floating-point tensors.
 
 ### Adhere to `.gitignore` re-inclusion patterns.
 ### TODO: Fix
