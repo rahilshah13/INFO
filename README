@@ -1,10 +1,7 @@
-INFO is an untyped programming language that targets signed-32-bit-floating-point tensors.
+INFO is an untyped programming language targeting signed-32-bit-floating-point tensors.
 
 ### Adhere to `.gitignore` re-inclusion patterns.
-### TODO: Fix
 
-### INFO Tenets 
 1. Log INFO
 2. Index INFO
 3. Compile INFO
-4. Train INFO
