@@ -1,76 +1,92 @@
-// brew install libomp
 // clang -Xpreprocessor -fopenmp -lomp -I$(brew --prefix libomp)/include -L$(brew --prefix libomp)/lib info_txt_compiler.c -o info_txt_compiler
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <omp.h>
+#include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <omp.h>
 
-#define IR(u, s, m) if(strstr(u, s)) printf("%s", m)
-#define FLAG(n) (strcmp(argv[i], n) == 0)
-#define ARG(n, l) (strncmp(argv[i], n, l) == 0)
+#define GROW(p, c, cap, t) if ((c) >= (cap)) { (cap) = (cap) ? (cap) * 2 : 4; (p) = realloc((p), (cap) * sizeof(t)); }
 #define MAX_FILES 1024
 
-int main(int argc, char** argv) {
-    int safe = 0, f_cnt = 0;
-    char *l_mem = "inf", *l_time = "inf", *f_cont[MAX_FILES], *f_names[MAX_FILES];
+typedef struct { float *data; size_t *shape; size_t rank; const char *id; } Tensor;
+typedef struct { Tensor *tensors; size_t count, capacity; } TensorList;
+typedef struct { const uint8_t *start; size_t length; } ClosureSlice;
+typedef struct { const char *id; ClosureSlice slice; } IndexEntry;
+typedef struct { IndexEntry *entries; size_t count, capacity; } InfoIndex;
 
-    for (int i = 1; i < argc; i++) {
-        if (FLAG("--safe")) safe = 1;
-        else if (ARG("--linker-memory=", 16)) l_mem = argv[i] + 16;
-        else if (ARG("--linker-allotted-time=", 23)) l_time = argv[i] + 23;
+const char *IPA[] = {"p","b","t","d","k","g","m","n","ŋ","f","v","θ","ð","s","z","ʃ","ʒ","h","tʃ","dʒ","w","j","r","l","i","ɪ","e","ɛ","æ","a","ə","ʌ","u","ʊ","o","ɔ","ɑ","ɒ","aɪ","eɪ","ɔɪ","aʊ","oʊ"};
+
+typedef struct { int pos; uint8_t depth; } Metrics;
+
+Metrics get_metrics(const char *w) {
+    Metrics m = {3, 1};
+    char cmd[512];
+    snprintf(cmd, 512, "tpl -q -g \"consult(['predicate.pl','words.pl']), (entry('%s', P, _, _) -> write(P); write(x)), halt.\" 2>/dev/null", w);
+    FILE *fp = popen(cmd, "r");
+    if (fp) { char r[8]; if (fgets(r, 8, fp)) { if(*r=='n') m.pos=0; else if(*r=='v') m.pos=1; else if(*r=='a') m.pos=2; } pclose(fp); }
+    if (m.pos == 0) m.depth = 2;
+    return m;
+}
+
+void fill_bpe(ClosureSlice c, float *d, size_t n) {
+    for (size_t i = 0, t = 0; i < c.length - 1 && t < n; i++) {
+        if (!isspace(c.start[i]) && !isspace(c.start[i+1])) d[t++] = (float)((c.start[i] << 8) | c.start[i+1]);
     }
+}
 
-    DIR *d = opendir("../info_txt_volume/");
-    struct dirent *e;
-    while (d && (e = readdir(d)) && f_cnt < MAX_FILES) {
-        if (strstr(e->d_name, "INFO_") && strstr(e->d_name, ".txt")) {
-            char p[512];
-            snprintf(p, 512, "../info_txt_volume/%s", e->d_name);
-            FILE *f = fopen(p, "rb");
-            if (f) {
-                fseek(f, 0, SEEK_END);
-                long s = ftell(f);
-                rewind(f);
-                f_cont[f_cnt] = malloc(s + 1);
-                fread(f_cont[f_cnt], 1, s, f);
-                f_cont[f_cnt][s] = 0;
-                f_names[f_cnt++] = strdup(e->d_name);
-                fclose(f);
-            }
+void fill_ipa(ClosureSlice c, float *d, size_t n) {
+    for (size_t i = 0, t = 0; i < c.length && t < n; i++) {
+        for (size_t p = 0; p < 43; p++) {
+            size_t l = strlen(IPA[p]);
+            if (i + l <= c.length && !strncmp((char*)&c.start[i], IPA[p], l)) { d[t++] = (float)(p + 1); i += l - 1; break; }
         }
     }
+}
+
+Tensor gen_tensor(ClosureSlice c, const char *id) {
+    Tensor t = {calloc(432, sizeof(float)), calloc(2, sizeof(size_t)), 2, id};
+    t.shape[0] = 1; t.shape[1] = 432;
+    char w[64] = {0}; for(size_t i=0; i<c.length && i<63 && !isspace(c.start[i]); i++) w[i] = tolower(c.start[i]);
+    Metrics m = get_metrics(w);
+    for (int i = 0; i < 300; i++) t.data[i] = (0.01f * i) * (m.depth > 1 ? 1.5f : 1.0f);
+    t.data[300 + m.pos] = 1.0f; t.data[303] = (float)m.depth;
+    fill_bpe(c, &t.data[304], 64); fill_ipa(c, &t.data[368], 64);
+    return t;
+}
+
+void proc_file(const char *p, const char *fn, InfoIndex *idx, TensorList *tl) {
+    int fd = open(p, O_RDONLY); struct stat sb; fstat(fd, &sb);
+    uint8_t *src = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    for (size_t i = 0, c = 0; i < sb.st_size && c < 1024; i++) {
+        if (isspace(src[i])) continue;
+        ClosureSlice cs = {&src[i], 0}; while (i < sb.st_size && !(i+1 < sb.st_size && src[i]=='\n' && src[i+1]=='\n')) { cs.length++; i++; }
+        char b[256]; snprintf(b, 256, "%s_%zu", fn, c++);
+        #pragma omp critical
+        { GROW(idx->entries, idx->count, idx->capacity, IndexEntry); idx->entries[idx->count++] = (IndexEntry){strdup(b), cs}; }
+        Tensor t = gen_tensor(cs, idx->entries[idx->count-1].id);
+        #pragma omp critical
+        { GROW(tl->tensors, tl->count, tl->capacity, Tensor); tl->tensors[tl->count++] = t; }
+    }
+    munmap(src, sb.st_size); close(fd);
+}
+
+int main(int argc, char **argv) {
+    int f_cnt = 0; char *names[MAX_FILES], paths[MAX_FILES][512];
+    DIR *d = opendir("../info_txt_volume/"); struct dirent *e;
+    while (d && (e = readdir(d)) && f_cnt < MAX_FILES) if (strstr(e->d_name, "INFO_")) { snprintf(paths[f_cnt], 512, "../info_txt_volume/%s", e->d_name); names[f_cnt++] = strdup(e->d_name); }
     if(d) closedir(d);
-
-    #pragma omp parallel for schedule(dynamic)
-    for (int i = 0; i < f_cnt; i++) {
-        if (safe) {
-            int l = 1, c = 1;
-            for (char *p = f_cont[i]; *p; p++) {
-                if (!isalnum(*p) && !strchr(" ->\n\t-", *p))
-                    printf("[L-ERR] %s | %d:%d | '%c'\n", f_names[i], l, c, *p);
-                (*p == '\n') ? (l++, c = 1) : c++;
-            }
-        }
-
-        char *s1, *s2, *cl = strtok_r(f_cont[i], "\n\n", &s1);
-        while (cl) {
-            char *ln = strtok_r(cl, "\n", &s2);
-            while (ln) {
-                printf("[%s] %s: ", f_names[i], (ln[0]==' '||ln[0]=='\t') ? "CLOS" : "UNIT");
-                IR(ln, "INCREMENT", "INC "); 
-                IR(ln, "DECREMENT", "DEC "); 
-                IR(ln, "->", "PTR ");
-                puts("| [0,1]");
-                ln = strtok_r(NULL, "\n", &s2);
-            }
-            cl = strtok_r(NULL, "\n\n", &s1);
-        }
-    }
-
-    printf("Linker: MEM=%s TIME=%s. Compiled.\n", l_mem, l_time);
-    for(int i = 0; i < f_cnt; i++) { free(f_cont[i]); free(f_names[i]); }
+    InfoIndex idx = {0}; TensorList tl = {0};
+    #pragma omp parallel for
+    for (int i = 0; i < f_cnt; i++) proc_file(paths[i], names[i], &idx, &tl);
+    printf("Compiled %zu tensors.\n", tl.count);
+    for (size_t i = 0; i < tl.count; i++) { free(tl.tensors[i].data); free(tl.tensors[i].shape); }
+    for (size_t i = 0; i < idx.count; i++) free((void*)idx.entries[i].id);
+    free(idx.entries); free(tl.tensors); for(int i=0; i<f_cnt; i++) free(names[i]);
     return 0;
 }
