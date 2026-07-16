@@ -1,7 +1,3 @@
 INFO is an untyped programming language targeting signed-32-bit-floating-point tensors.
 
 ### Adhere to `.gitignore` re-inclusion patterns.
-
-1. Log INFO
-2. Index INFO
-3. Compile INFO
