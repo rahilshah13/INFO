@@ -20,4 +20,4 @@ RUN clang -Xpreprocessor -fopenmp -lomp -I$(echo /usr/lib/llvm*/include) -L$(ech
 VOLUME [ "/INFO_ARTIFACTS", "/info_txt_volume" ]
 
 # Run download script then compiler
-CMD ["sh", "-c", "python3 downloader.py && ./INFO"]
+CMD ["sh", "-c", "python3 _download_INFO.py && ./INFO"]
