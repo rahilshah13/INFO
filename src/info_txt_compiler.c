@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <omp.h>
 #include <math.h>
+#include <espeak-ng/speak_lib.h>
 
 #define GROW(p, c, cap, t) if ((c) >= (cap)) { (cap) = (cap) ? (cap) * 2 : 4; (p) = realloc((p), (cap) * sizeof(t)); }
 #define MAX_FILES 1024
@@ -98,6 +99,32 @@ void fill_ipa_bpe(ClosureSlice c, float *d, size_t n) {
     for (size_t i = 0, t = 0; i + 1 < ipa_count && t < n; i++) {
         d[t++] = (float)((ipa_indices[i] << 8) | ipa_indices[i+1]);
     }
+}
+
+void synthesize_ipa_wav(const char *ipa_text, const char *out_wav_path) {
+    char espeak_input[1024];
+    snprintf(espeak_input, sizeof(espeak_input), "[[%s]]", ipa_text);
+    
+    espeak_Initialize(espeak_AUDIO_OUTPUT_RETRIEVAL, 0, NULL, 0);
+    espeak_SetVoiceByName("en");
+
+    FILE *wav_file = fopen(out_wav_path, "wb");
+    if (!wav_file) return;
+
+    uint8_t wav_header[44] = {
+        'R','I','F','F', 0,0,0,0, 'W','A','V','E',
+        'f','m','t',' ', 16,0,0,0, 1,0, 1,0, 
+        (uint8_t)(22050 & 0xff), (uint8_t)((22050 >> 8) & 0xff), 0,0,
+        (uint8_t)(44100 & 0xff), (uint8_t)((44100 >> 8) & 0xff), 2,0, 16,0,
+        'd','a','t','a', 0,0,0,0
+    };
+    fwrite(wav_header, 1, 44, wav_file);
+
+    espeak_Synth(espeak_input, strlen(espeak_input) + 1, 0, POS_CHARACTER, 0, espeakCHARS_AUTO, NULL, NULL);
+    espeak_Synchronize();
+    
+    fclose(wav_file);
+    espeak_Terminate();
 }
 
 Tensor gen_tensor(ClosureSlice c, const char *id, float tfidf) {
