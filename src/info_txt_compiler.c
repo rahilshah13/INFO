@@ -13,6 +13,7 @@
 
 #define GROW(p, c, cap, t) if ((c) >= (cap)) { (cap) = (cap) ? (cap) * 2 : 4; (p) = realloc((p), (cap) * sizeof(t)); }
 #define MAX_FILES 1024
+#define MAX_DEF_LENGTH 128
 
 typedef struct { float *data; size_t *shape; size_t rank; const char *id; } Tensor;
 typedef struct { Tensor *tensors; size_t count, capacity; } TensorList;
@@ -22,24 +23,48 @@ typedef struct { IndexEntry *entries; size_t count, capacity; } InfoIndex;
 
 const char *IPA[] = {"p","b","t","d","k","g","m","n","ŋ","f","v","θ","ð","s","z","ʃ","ʒ","h","tʃ","dʒ","w","j","r","l","i","ɪ","e","ɛ","æ","a","ə","ʌ","u","ʊ","o","ɔ","ɑ","ɒ","aɪ","eɪ","ɔɪ","aʊ","oʊ"};
 
-typedef struct { int pos; uint8_t depth; int transitive; int sourceType; int nodeComplexity; float avgWordLen; float wordsPerClosure; int correctSentences; int incorrectSentences; } Metrics;
+typedef struct { 
+    int pos; 
+    uint8_t depth; 
+    int transitive; 
+    int sourceType; 
+    int nodeComplexity; 
+    float avgWordLen; 
+    float wordsPerClosure; 
+    int correctSentences; 
+    int incorrectSentences; 
+    float lexicalDensity;
+    float semanticCoherence;
+    float syntacticEntropy;
+    float readabilityScore;
+    size_t bpeLen; 
+    size_t ipaBpeLen; 
+} Metrics;
 
 Metrics get_metrics(const char *w, const char *closure_text) {
-    Metrics m = {3, 1, 0, 0, 0, 0.0f, 0.0f, 0, 0};
+    Metrics m = {3, 1, 0, 0, 0, 0.0f, 0.0f, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0, 0};
     char cmd[1024];
-    snprintf(cmd, 1024, "tpl -l predicate.pl -l words.pl -g \"(entry('%s', P, _, _) -> (is_transitive('%s') -> T=1; T=0), phrase_depth('%s', D), (is_module('%s') -> S=1; S=0), decl_count('%s', C), avg_word_length('%s', AW), words_per_closure('%s', WC), sentence_eval('%s', Cor, Inc), format('~w,~w,~w,~w,~w,~w,~w,~w,~w', [P, T, D, S, C, AW, WC, Cor, Inc]); write('x,0,1,0,0,0.0,0.0,0,0')), halt.\" 2>/dev/null", w, w, w, w, w, closure_text, closure_text, closure_text);
+    snprintf(cmd, 1024, "tpl -l predicate.pl -l words.pl -g \"(entry('%s', _, _, Def), atom_length(Def, Len), Len =< %d -> (entry('%s', P, _, _) -> (is_transitive('%s') -> T=1; T=0), phrase_depth('%s', D), (is_module('%s') -> S=1; S=0), decl_count('%s', C), avg_word_length('%s', AW), words_per_closure('%s', WC), sentence_eval('%s', Cor, Inc), lexical_density('%s', LD), semantic_coherence('%s', SC), syntactic_entropy('%s', SE), readability_score('%s', RS), bpe_len('%s', BL), ipa_len_val('%s', IBL), format('~w,~w,~w,~w,~w,~w,~w,~w,~w,~w,~w,~w,~w,~w,~w', [P, T, D, S, C, AW, WC, Cor, Inc, LD, SC, SE, RS, BL, IBL]); write('x,0,1,0,0,0.0,0,0,0,0.0,0.0,0.0,0.0,0,0')); write('bunk,0,1,0,0,0.0,0,0,0,0.0,0.0,0.0,0.0,0,0')), halt.\" 2>/dev/null", w, MAX_DEF_LENGTH, w, w, w, w, w, closure_text, closure_text, closure_text, closure_text, closure_text, closure_text, closure_text, closure_text, closure_text);
     FILE *fp = popen(cmd, "r");
     if (fp) { char r[256]; if (fgets(r, 256, fp)) {
-        char *t[9]; int i=0; t[0]=strtok(r,","); while(i<8) t[++i]=strtok(NULL,",");
-        if(t[0]) { if(*t[0]=='n') m.pos=0; else if(*t[0]=='v') m.pos=1; else if(*t[0]=='a') m.pos=2; }
-        if(t[1]) m.transitive = atoi(t[1]);
-        if(t[2]) m.depth = (uint8_t)atoi(t[2]);
-        if(t[3]) m.sourceType = atoi(t[3]);
-        if(t[4]) m.nodeComplexity = atoi(t[4]);
-        if(t[5]) m.avgWordLen = (float)atof(t[5]);
-        if(t[6]) m.wordsPerClosure = (float)atof(t[6]);
-        if(t[7]) m.correctSentences = atoi(t[7]);
-        if(t[8]) m.incorrectSentences = atoi(t[8]);
+        char *t[15]; int i=0; t[0]=strtok(r,","); while(i<14) t[++i]=strtok(NULL,",");
+        if(t[0] && strcmp(t[0], "bunk") != 0) {
+            if(*t[0]=='n') m.pos=0; else if(*t[0]=='v') m.pos=1; else if(*t[0]=='a') m.pos=2;
+            if(t[1]) m.transitive = atoi(t[1]);
+            if(t[2]) m.depth = (uint8_t)atoi(t[2]);
+            if(t[3]) m.sourceType = atoi(t[3]);
+            if(t[4]) m.nodeComplexity = atoi(t[4]);
+            if(t[5]) m.avgWordLen = (float)atof(t[5]);
+            if(t[6]) m.wordsPerClosure = (float)atof(t[6]);
+            if(t[7]) m.correctSentences = atoi(t[7]);
+            if(t[8]) m.incorrectSentences = atoi(t[8]);
+            if(t[9]) m.lexicalDensity = (float)atof(t[9]);
+            if(t[10]) m.semanticCoherence = (float)atof(t[10]);
+            if(t[11]) m.syntacticEntropy = (float)atof(t[11]);
+            if(t[12]) m.readabilityScore = (float)atof(t[12]);
+            if(t[13]) m.bpeLen = (size_t)atoi(t[13]);
+            if(t[14]) m.ipaBpeLen = (size_t)atoi(t[14]);
+        }
     } pclose(fp); }
     return m;
 }
@@ -50,31 +75,55 @@ void fill_bpe(ClosureSlice c, float *d, size_t n) {
     }
 }
 
-void fill_ipa(ClosureSlice c, float *d, size_t n) {
-    for (size_t i = 0, t = 0; i < c.length && t < n; i++) {
+void fill_ipa_bpe(ClosureSlice c, float *d, size_t n) {
+    int ipa_indices[512];
+    size_t ipa_count = 0;
+    
+    for (size_t i = 0; i < c.length && ipa_count < 512; i++) {
+        int matched = 0;
         for (size_t p = 0; p < 43; p++) {
             size_t l = strlen(IPA[p]);
-            if (i + l <= c.length && !strncmp((char*)&c.start[i], IPA[p], l)) { d[t++] = (float)(p + 1); i += l - 1; break; }
+            if (i + l <= c.length && !strncmp((char*)&c.start[i], IPA[p], l)) {
+                ipa_indices[ipa_count++] = (int)(p + 1);
+                i += l - 1;
+                matched = 1;
+                break;
+            }
         }
+        if (!matched && !isspace(c.start[i])) {
+            ipa_indices[ipa_count++] = (int)c.start[i];
+        }
+    }
+
+    for (size_t i = 0, t = 0; i + 1 < ipa_count && t < n; i++) {
+        d[t++] = (float)((ipa_indices[i] << 8) | ipa_indices[i+1]);
     }
 }
 
 Tensor gen_tensor(ClosureSlice c, const char *id, float tfidf) {
-    Tensor t = {calloc(442, sizeof(float)), calloc(2, sizeof(size_t)), 2, id};
-    t.shape[0] = 1; t.shape[1] = 442;
     char w[64] = {0}; for(size_t i=0; i<c.length && i<63 && !isspace(c.start[i]); i++) w[i] = tolower(c.start[i]);
     char *c_text = malloc(c.length + 1);
     memcpy(c_text, c.start, c.length);
     c_text[c.length] = '\0';
     Metrics m = get_metrics(w, c_text);
     free(c_text);
+
+    size_t total_dim = 300 + 3 + 5 + 8 + m.bpeLen + m.ipaBpeLen;
+    Tensor t = {calloc(total_dim, sizeof(float)), calloc(2, sizeof(size_t)), 2, id};
+    t.shape[0] = 1; t.shape[1] = total_dim;
+
     for (int i = 0; i < 300; i++) t.data[i] = ((float)rand()/(float)RAND_MAX) * (m.depth > 1 ? 1.5f : 1.0f);
     t.data[300 + m.pos] = 1.0f; t.data[303] = (float)m.depth;
     t.data[304] = (float)m.transitive; t.data[305] = tfidf;
     t.data[306] = (float)m.sourceType; t.data[307] = (float)m.nodeComplexity;
     t.data[308] = m.avgWordLen; t.data[309] = m.wordsPerClosure;
     t.data[310] = (float)m.correctSentences; t.data[311] = (float)m.incorrectSentences;
-    fill_bpe(c, &t.data[312], 64); fill_ipa(c, &t.data[376], 64);
+    t.data[312] = m.lexicalDensity; t.data[313] = m.semanticCoherence;
+    t.data[314] = m.syntacticEntropy; t.data[315] = m.readabilityScore;
+    
+    if (m.bpeLen > 0) fill_bpe(c, &t.data[316], m.bpeLen); 
+    if (m.ipaBpeLen > 0) fill_ipa_bpe(c, &t.data[316 + m.bpeLen], m.ipaBpeLen);
+    
     return t;
 }
 
