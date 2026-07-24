@@ -16,8 +16,6 @@ RUN mkdir -p temp_facts && \
 
 # Compile compiler linking espeak-ng library (-lespeak-ng)
 RUN clang -Xpreprocessor -fopenmp -lomp -lespeak-ng -I$(echo /usr/lib/llvm*/include) -L$(echo /usr/lib/llvm*/lib) info_txt_compiler.c -o INFO
-
 VOLUME [ "/INFO_ARTIFACTS", "/info_txt_volume" ]
-
 # Run download script then compiler
 CMD ["sh", "-c", "python3 _download_INFO.py && ./INFO"]
