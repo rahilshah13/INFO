@@ -1,7 +1,7 @@
 /*
-!/artifacts_volume/
-!/info_txt_volume/
+!.gitignore
 !/src/
 !Dockerfile
 !README
-!verify_hashes.sh
+!_download_INFO.py
+!index.jsx

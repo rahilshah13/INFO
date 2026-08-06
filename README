@@ -1,3 +1,7 @@
 INFO is an untyped programming language targeting signed-32-bit-floating-point tensors.
 
 ### Adhere to `.gitignore` re-inclusion patterns.
+
+--- 
+- Build: `docker build -t info .`
+- Run: `docker run --rm -p 3000:3000 -p 5001:5000 -v $(pwd)/volume:/info_txt_volume info`
