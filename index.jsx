@@ -1,5 +1,6 @@
 import { createSignal, For, onCleanup, onMount } from "solid-js";
 import { action, query, useAction } from "@solidjs/router";
+import { numpy as np, jit, vmap, lax } from "@jax-js/jax";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -166,56 +167,95 @@ export function tokensToText(tokenIds, vocab) {
   return tokenIds.map(id => dict[Math.abs(Math.round(id)) % dict.length]).join(" ");
 }
 
-export function random_matrix(rows, cols, scale = 0.05) {
-  return Array.from({ length: rows }, () => Array.from({ length: cols }, () => (Math.random() * 2 - 1) * scale));
+export function random_matrix(rows, cols, scale = 0.02) {
+  const data = Array.from({ length: rows * cols }, () => (Math.random() * 2 - 1) * scale);
+  return np.array(data, { dtype: np.float32 }).reshape([rows, cols]);
 }
 
-export function random_vector(dim, scale = 0.05) {
-  return Array.from({ length: dim }, () => (Math.random() * 2 - 1) * scale);
+export function random_vector(dim, scale = 0.02) {
+  const data = Array.from({ length: dim }, () => (Math.random() * 2 - 1) * scale);
+  return np.array(data, { dtype: np.float32 });
 }
 
-export function matmul(A, vec) {
-  return A.map(row => row.reduce((sum, val, idx) => sum + val * (vec[idx] || 0), 0));
-}
-
-export function add_vec(a, b) {
-  return a.map((val, idx) => val + (b[idx] || 0));
-}
-
-export function relu(v) {
-  return v.map(x => Math.max(0, x));
+export function layerNorm(x, eps = 1e-5) {
+  const mean = x.ref.mean();
+  const variance = x.ref.sub(mean.ref).square().mean();
+  const normalized = x.ref.sub(mean.ref).div(variance.ref.add(eps).sqrt());
+  mean.dispose();
+  variance.dispose();
+  return normalized;
 }
 
 export function softmax(arr) {
-  const max = Math.max(...arr);
-  const exps = arr.map(x => Math.exp(x - max));
-  const sum = exps.reduce((a, b) => a + b, 1e-9);
-  return exps.map(x => x / sum);
+  const maxVal = arr.max().toArray()[0];
+  const shifted = arr.ref.sub(maxVal);
+  const exps = np.exp(shifted.ref);
+  const sumExp = exps.ref.sum().toArray()[0] + 1e-9;
+  return exps.div(sumExp);
 }
 
-export function scaledDotProductAttention(Q, K, V) {
-  const d_k = Math.sqrt(Q.length) || 1;
-  const scores = K.map(k_row => k_row.reduce((sum, val, i) => sum + val * (Q[i] || 0), 0) / d_k);
-  const weights = softmax(scores);
-  return V.map((v_row, i) => v_row.map(val => val * weights[i])).reduce((acc, row) => acc.map((v, idx) => v + row[idx]), new Array(V[0].length).fill(0));
+export function multiHeadAttention(Q, K, V, numHeads = 16) {
+  const dModel = Q.shape[0];
+  const dHead = Math.floor(dModel / numHeads);
+  const d_k = Math.sqrt(dHead) || 1;
+
+  let headOutputs = [];
+  for (let h = 0; h < numHeads; h++) {
+    const start = h * dHead;
+    const end = (h === numHeads - 1) ? dModel : (h + 1) * dHead;
+    
+    const Q_h = Q.ref.slice([start], [end]);
+    const K_h = K.ref.slice([start], [end]);
+    const V_h = V.ref.slice([start], [end]);
+
+    const scores = Q_h.ref.matmul(K_h.ref.reshape([1, K_h.shape[0]])).div(d_k);
+    const weights = softmax(scores);
+    const headOut = V_h.ref.mul(weights.ref.toArray()[0] || 1.0);
+    headOutputs.push(headOut);
+
+    Q_h.dispose();
+    K_h.dispose();
+    V_h.dispose();
+    scores.dispose();
+    weights.dispose();
+  }
+
+  const concatenated = np.concatenate(headOutputs);
+  headOutputs.forEach(t => t.dispose());
+  return concatenated;
 }
+
+// Vectorized batch projection transform using vmap
+const batchProject = vmap((W, x) => W.matmul(x));
 
 class ParameterStore {
   constructor(initial_params) {
-    this.active_params = JSON.parse(JSON.stringify(initial_params));
-    this.inference_snapshot = JSON.parse(JSON.stringify(initial_params));
+    this.active_params = initial_params;
+    this.inference_snapshot = {};
+    for (const [k, v] of Object.entries(initial_params)) {
+      this.inference_snapshot[k] = typeof v.copy === "function" ? v.copy() : v;
+    }
     this.lock = false;
   }
   update(new_params) {
-    this.active_params = JSON.parse(JSON.stringify(new_params));
+    this.active_params = new_params;
     if (!this.lock) {
       this.lock = true;
-      this.inference_snapshot = JSON.parse(JSON.stringify(new_params));
+      for (const [k, v] of Object.entries(new_params)) {
+        if (this.inference_snapshot[k] && typeof this.inference_snapshot[k].dispose === "function") {
+          this.inference_snapshot[k].dispose();
+        }
+        this.inference_snapshot[k] = typeof v.copy === "function" ? v.copy() : v;
+      }
       this.lock = false;
     }
   }
   getInferenceSnapshot() {
-    return JSON.parse(JSON.stringify(this.inference_snapshot));
+    const snap = {};
+    for (const [k, v] of Object.entries(this.inference_snapshot)) {
+      snap[k] = typeof v.copy === "function" ? v.copy() : v;
+    }
+    return snap;
   }
 }
 
@@ -279,64 +319,85 @@ export class WindowSampler {
 }
 
 export class TransformerDiffusionEncoder {
-  constructor(input_dim = 16, target_encoding_dim = 16, vocab = []) {
+  constructor(input_dim = 1000, target_encoding_dim = 1000, vocab = []) {
     this.target_dim = target_encoding_dim;
     this.half_dim = Math.floor(target_encoding_dim / 2);
     this.vocab = vocab.length > 0 ? vocab : ["transformer", "attention", "weights", "matrix", "vector"];
 
     this.store = new ParameterStore({
-      W_q: random_matrix(this.target_dim, this.target_dim),
-      W_k: random_matrix(this.target_dim, this.target_dim),
-      W_v: random_matrix(this.target_dim, this.target_dim),
-      W_h: random_matrix(32, this.target_dim),
-      b_h: random_vector(32),
-      W_full: random_matrix(this.target_dim, 32),
-      b_full: random_vector(this.target_dim),
-      W_half: random_matrix(this.half_dim, 32),
-      b_half: random_vector(this.half_dim),
-      W_rec_full: random_matrix(this.target_dim, this.target_dim),
-      W_rec_half: random_matrix(this.target_dim, this.half_dim),
-      W_denoise: random_matrix(this.target_dim, this.target_dim + 1)
+      W_q: random_matrix(this.target_dim, this.target_dim, 0.01),
+      W_k: random_matrix(this.target_dim, this.target_dim, 0.01),
+      W_v: random_matrix(this.target_dim, this.target_dim, 0.01),
+      W_h: random_matrix(256, this.target_dim, 0.01),
+      b_h: random_vector(256, 0.01),
+      W_full: random_matrix(this.target_dim, 256, 0.01),
+      b_full: random_vector(this.target_dim, 0.01),
+      W_half: random_matrix(this.half_dim, 256, 0.01),
+      b_half: random_vector(this.half_dim, 0.01),
+      W_rec_full: random_matrix(this.target_dim, this.target_dim, 0.01),
+      W_rec_half: random_matrix(this.target_dim, this.half_dim, 0.01),
+      W_denoise: random_matrix(this.target_dim, this.target_dim + 1, 0.01)
+    });
+
+    // JIT compile the core encode forward pass
+    this._jitEncode = jit((params, x_padded) => {
+      const Q = params.W_q.ref.matmul(x_padded.ref);
+      const K = params.W_k.ref.matmul(x_padded.ref);
+      const V = params.W_v.ref.matmul(x_padded.ref);
+      
+      const attended = layerNorm(multiHeadAttention(Q, K, V, 16));
+      const hidden = np.maximum(0, layerNorm(params.W_h.ref.matmul(attended).add(params.b_h.ref)));
+      
+      const z_full = layerNorm(params.W_full.ref.matmul(hidden.ref).add(params.b_full.ref));
+      const z_half = layerNorm(params.W_half.ref.matmul(hidden.ref).add(params.b_half.ref));
+      
+      const x_rec_full = params.W_rec_full.ref.matmul(z_full.ref);
+      const x_rec_half = params.W_rec_half.ref.matmul(z_half.ref);
+
+      Q.dispose();
+      K.dispose();
+      V.dispose();
+      attended.dispose();
+      hidden.dispose();
+
+      return { z_full, z_half, x_rec_full, x_rec_half };
     });
   }
 
   setVocab(vocab) { if (vocab?.length) this.vocab = vocab; }
 
   encode(params, x_padded) {
-    const Q = matmul(params.W_q, x_padded);
-    const K = matmul(params.W_k, x_padded);
-    const V = matmul(params.W_v, x_padded);
-    const attended = scaledDotProductAttention(Q, [K], [V]);
-    const hidden = relu(add_vec(matmul(params.W_h, attended), params.b_h));
-    return {
-      z_full: add_vec(matmul(params.W_full, hidden), params.b_full),
-      z_half: add_vec(matmul(params.W_half, hidden), params.b_half),
-      x_rec_full: matmul(params.W_rec_full, add_vec(matmul(params.W_full, hidden), params.b_full)),
-      x_rec_half: matmul(params.W_rec_half, add_vec(matmul(params.W_half, hidden), params.b_half))
-    };
+    return this._jitEncode(params, x_padded);
   }
 
-  diffusionInversionAndSample(steps = 8, samplerInstance = null, targetCompletionTokens = 16, temperature = 1.0, topK = 0, topP = 0.0) {
+  diffusionInversionAndSample(steps = 32, samplerInstance = null, targetCompletionTokens = 16, temperature = 0.8, topK = 50, topP = 0.9, seedTokenIds = null) {
     const params = this.store.getInferenceSnapshot();
     const sampler = samplerInstance || new WindowSampler(this.vocab);
-    const { token_ids, span: seedDecoded, docId } = sampler.sample_inference_seed();
     
-    const z_seed = new Array(this.target_dim).fill(0);
+    let token_ids;
+    let docId = "custom_seed";
+    if (seedTokenIds && seedTokenIds.length > 0) {
+      token_ids = seedTokenIds;
+    } else {
+      const sampled = sampler.sample_inference_seed();
+      token_ids = sampled.token_ids;
+      docId = sampled.docId;
+    }
+    const seedDecoded = tokensToText(token_ids, this.vocab);
+    
+    const z_seed_arr = new Array(this.target_dim).fill(0);
     token_ids.forEach((id, idx) => {
       if (idx < this.target_dim) {
-        z_seed[idx] = (id / Math.max(1, this.vocab.length)) * 2.0 - 1.0;
+        z_seed_arr[idx] = (id / Math.max(1, this.vocab.length)) * 2.0 - 1.0;
       }
     });
-    const z_seed_half = z_seed.slice(0, this.half_dim);
-
-    const timesteps = Array.from({ length: steps }, (_, i) => 1.0 - (i / (steps - 1 || 1)));
-
+    
+    let current_z_arr = [...z_seed_arr];
     const mockPartsOfSpeech = ["n", "v", "adj", "adv", "pron", "det", "prep", "conj"];
 
     const sampleNextTokenId = (logitsArr) => {
       let scaled = logitsArr.map(l => l / Math.max(1e-5, temperature));
-      let probs = softmax(scaled);
-      
+      let probs = softmax(np.array(scaled, { dtype: np.float32 })).toArray();
       let indexedProbs = probs.map((p, idx) => ({ p, idx }));
       
       if (topK > 0 && topK < indexedProbs.length) {
@@ -369,83 +430,103 @@ export class TransformerDiffusionEncoder {
       return indexedProbs[0]?.idx % Math.max(1, this.vocab.length) || 0;
     };
 
-    const denoise_step = (current_z, t, stepIdx, isHalf = false) => {
-      const padded = isHalf ? [...current_z, ...new Array(this.target_dim - current_z.length).fill(0)] : current_z;
-      const rawLogits = matmul(params.W_denoise, [...padded, t]);
+    const trajectoryFull = [];
+    const trajectoryHalf = [];
+
+    for (let step = 1; step <= steps; step++) {
+      const tVal = 1.0 - ((step - 1) / (steps - 1 || 1));
+      const paddedArr = [...current_z_arr];
+      const inputVec = np.array([...paddedArr, tVal], { dtype: np.float32 });
       
-      const alpha = 1.0 - t * 0.15;
-      const next_z = current_z.map((val, idx) => alpha * val + 0.1 * rawLogits[idx % rawLogits.length]);
+      const rawLogitsTensor = params.W_denoise.ref.matmul(inputVec);
+      const rawLogits = rawLogitsTensor.toArray();
+      rawLogitsTensor.dispose();
+      inputVec.dispose();
+      
+      const alpha = 1.0 - tVal * 0.03;
+      current_z_arr = current_z_arr.map((val, idx) => alpha * val + 0.05 * rawLogits[idx % rawLogits.length]);
       
       const truncatedTokenIds = [];
       for (let i = 0; i < targetCompletionTokens; i++) {
-        const stepLogits = rawLogits.map((l, lIdx) => l + Math.sin(i + lIdx + t));
+        const stepLogits = rawLogits.map((l, lIdx) => l + Math.sin(i + lIdx + tVal));
         const chosenId = sampleNextTokenId(stepLogits);
         truncatedTokenIds.push(chosenId);
       }
 
       const pureCompletion = tokensToText(truncatedTokenIds, this.vocab);
-
       const lexicalEntries = truncatedTokenIds.map((id, index) => {
         const lemma = this.vocab[id % this.vocab.length] || "term";
         const pos = mockPartsOfSpeech[(id + index) % mockPartsOfSpeech.length];
         return [lemma, pos];
       });
 
-      return [next_z, { step: stepIdx + 1, t: Number(t.toFixed(2)), logits: rawLogits, pureCompletion, lexicalEntries }];
-    };
-
-    let carry_full = [...z_seed];
-    const trajectoryFull = [];
-    for (let i = 0; i < timesteps.length; i++) {
-      const [next_carry, stepInfo] = denoise_step(carry_full, timesteps[i], i, false);
-      carry_full = next_carry;
+      const stepInfo = { step, t: Number(tVal.toFixed(2)), logits: rawLogits, pureCompletion, lexicalEntries };
       trajectoryFull.push(stepInfo);
-    }
-
-    let carry_half = [...z_seed_half];
-    const trajectoryHalf = [];
-    for (let i = 0; i < timesteps.length; i++) {
-      const [next_carry, stepInfo] = denoise_step(carry_half, timesteps[i], i, true);
-      carry_half = next_carry;
       trajectoryHalf.push(stepInfo);
     }
+
+    for (const v of Object.values(params)) v.dispose();
 
     return { seedDecoded, docId, trajectoryFull, trajectoryHalf };
   }
 
   trainStep(token_ids) {
-    const x_padded = new Array(16).fill(0);
-    token_ids.forEach((id, idx) => { if (idx < 16) x_padded[idx] = (id / this.vocab.length) * 2.0 - 1.0; });
+    if (!this._previousLoss) this._previousLoss = null;
+
+    const x_padded_arr = new Array(this.target_dim).fill(0);
+    token_ids.forEach((id, idx) => { if (idx < this.target_dim) x_padded_arr[idx] = (id / this.vocab.length) * 2.0 - 1.0; });
+    const x_padded = np.array(x_padded_arr, { dtype: np.float32 });
 
     const params = this.store.active_params;
     const { z_full, z_half, x_rec_full, x_rec_half } = this.encode(params, x_padded);
 
-    let mse_full = 0, mse_half = 0;
-    for (let i = 0; i < x_padded.length; i++) {
-      mse_full += Math.pow(x_padded[i] - x_rec_full[i], 2);
-      mse_half += Math.pow(x_padded[i] - x_rec_half[i], 2);
-    }
-    mse_full = Math.min(1, Math.max(0, mse_full / x_padded.length));
-    mse_half = Math.min(1, Math.max(0, mse_half / x_padded.length));
+    const xRecFullArr = x_rec_full.toArray();
+    const xRecHalfArr = x_rec_half.toArray();
+    const zFullArr = z_full.toArray();
 
-    const lr = 0.005;
-    for (let r = 0; r < params.W_full.length; r++) {
-      for (let c = 0; c < params.W_full[0].length; c++) {
-        params.W_full[r][c] -= lr * (x_rec_full[r % x_rec_full.length] - x_padded[r % x_padded.length]) * z_full[c % z_full.length];
-      }
+    let mse_full = 0, mse_half = 0;
+    for (let i = 0; i < x_padded_arr.length; i++) {
+      mse_full += Math.pow(x_padded_arr[i] - xRecFullArr[i], 2);
+      mse_half += Math.pow(x_padded_arr[i] - xRecHalfArr[i], 2);
     }
-    this.store.update(params);
+    mse_full = Math.min(1, Math.max(0, mse_full / x_padded_arr.length));
+    mse_half = Math.min(1, Math.max(0, mse_half / x_padded_arr.length));
+
+    const lossDelta = this._previousLoss !== null ? this._previousLoss - mse_full : 0;
+    const isConverging = lossDelta >= 0;
+    this._previousLoss = mse_full;
+
+    const lr = 0.001;
+    const diff = x_rec_full.ref.sub(x_padded);
+    const grad = diff.reshape([diff.shape[0], 1]).matmul(z_full.ref.reshape([1, z_full.shape[0]]));
+    const updated_W_full = params.W_full.ref.sub(grad.mul(lr));
+
+    const new_params = { ...params, W_full: updated_W_full };
+    this.store.update(new_params);
+
+    const decoded = tokensToText(zFullArr.map(v => Math.abs(Math.round((v + 1.0) * 0.5 * this.vocab.length))), this.vocab);
+
+    x_padded.dispose();
+    z_full.dispose();
+    z_half.dispose();
+    x_rec_full.dispose();
+    x_rec_half.dispose();
+    diff.dispose();
+    grad.dispose();
 
     return {
       loss_full: mse_full,
       loss_half: mse_half,
+      loss_delta: lossDelta,
+      is_converging: isConverging,
       fidelity_gain_pct: Math.max(0, ((mse_half - mse_full) / (mse_half + 1e-6)) * 100),
-      decoded: tokensToText(z_full.map(v => Math.abs(Math.round((v + 1.0) * 0.5 * this.vocab.length))), this.vocab)
+      decoded
     };
   }
 }
 
 export default function Home() {
+
   const runDaemonAction = useAction(triggerDownloadDaemon);
   const executeSaveCheckpoint = useAction(saveCheckpointAction);
 
@@ -458,6 +539,8 @@ export default function Home() {
   const [lossFull, setLossFull] = createSignal(0.18);
   const [lossHalf, setLossHalf] = createSignal(0.42);
   const [fidelityGain, setFidelityGain] = createSignal(40.1);
+  const [lossDelta, setLossDelta] = createSignal(0);
+  const [isConverging, setIsConverging] = createSignal(true);
   const [sampleLogs, setSampleLogs] = createSignal([]);
   const [downloadStatus, setDownloadStatus] = createSignal("Idle");
   const [articleCount, setArticleCount] = createSignal(5);
@@ -472,7 +555,6 @@ export default function Home() {
   const [isInferring, setIsInferring] = createSignal(false);
   const [targetTokens, setTargetTokens] = createSignal(16);
   
-  // Decoding hyperparameters (Andrej Karpathy nanoGPT style)
   const [temperature, setTemperature] = createSignal(0.8);
   const [topK, setTopK] = createSignal(50);
   const [topP, setTopP] = createSignal(0.9);
@@ -488,7 +570,7 @@ export default function Home() {
     status: "loading" 
   });
 
-  const encoder = new TransformerDiffusionEncoder(16, 16, vocab());
+  const encoder = new TransformerDiffusionEncoder(2000, 2000, vocab());
   const sampler = new WindowSampler(vocab(), corpus());
 
   let trainTimer = null;
@@ -563,9 +645,11 @@ export default function Home() {
     setLossFull(metrics.loss_full);
     setLossHalf(metrics.loss_half);
     setFidelityGain(metrics.fidelity_gain_pct);
+    setLossDelta(metrics.loss_delta);
+    setIsConverging(metrics.is_converging);
 
     setSampleLogs(prev => [
-      { id: Date.now(), docId: sampled.docId, span: sampled.span.slice(0, 52) + (sampled.span.length > 52 ? "..." : ""), charLength: sampled.charLength, lossFull: metrics.loss_full.toFixed(4), lossHalf: metrics.loss_half.toFixed(4) },
+      { id: Date.now(), docId: sampled.docId, span: sampled.span.slice(0, 52) + (sampled.span.length > 52 ? "..." : ""), charLength: sampled.charLength, lossFull: metrics.loss_full.toFixed(4), lossHalf: metrics.loss_half.toFixed(4), tokenIds: sampled.token_ids },
       ...prev.slice(0, 19)
     ]);
   };
@@ -575,10 +659,10 @@ export default function Home() {
     else { setIsTraining(true); trainTimer = setInterval(runTrainingStep, 200); }
   };
 
-  const runInference = () => {
+  const runInference = (customSeedTokens = null) => {
     setIsInferring(true);
     setTimeout(() => {
-      setDiffusionResult(encoder.diffusionInversionAndSample(8, sampler, targetTokens(), temperature(), topK(), topP()));
+      setDiffusionResult(encoder.diffusionInversionAndSample(32, sampler, targetTokens(), temperature(), topK(), topP(), customSeedTokens));
       setIsInferring(false);
     }, 50);
   };
@@ -700,7 +784,12 @@ export default function Home() {
           
           <div style={cardStyle}>
             <div style={{ "display": "flex", "justify-content": "space-between", "align-items": "center", "width": "100%" }}>
-              <h2 style={{ "font-size": "1.5rem", "font-weight": "700", "color": "#f8fafc", "margin": "0" }}>Model Training Daemon</h2>
+              <div style={{ "display": "flex", "align-items": "center", "gap": "12px" }}>
+                <h2 style={{ "font-size": "1.5rem", "font-weight": "700", "color": "#f8fafc", "margin": "0" }}>Model Training Daemon</h2>
+                <span style={{ "font-size": "0.75rem", "padding": "4px 10px", "border-radius": "9999px", "background-color": isConverging() ? "#064e3b" : "#7f1d1d", "color": isConverging() ? "#34d399" : "#fca5a5", "border": `1px solid ${isConverging() ? "#059669" : "#dc2626"}`, "font-weight": "600" }}>
+                  {isConverging() ? "● Converging Active" : "○ Adjusting..."}
+                </span>
+              </div>
               <button onClick={toggleTraining} style={{ "padding": "12px 24px", "border-radius": "6px", "font-weight": "600", "font-size": "1rem", "cursor": "pointer", "border": "none", "color": "#ffffff", "background-color": isTraining() ? "#e11d48" : "#059669" }}>
                 {isTraining() ? "Pause" : "Start"}
               </button>
@@ -724,7 +813,8 @@ export default function Home() {
             <div style={{ "display": "flex", "flex-direction": "column", "gap": "14px", "background-color": "#020617", "padding": "16px", "border-radius": "8px", "border": "1px solid #1e293b", "width": "100%", "box-sizing": "border-box" }}>
               <div style={{ "display": "flex", "flex-direction": "column", "gap": "6px" }}>
                 <div style={{ "display": "flex", "justify-content": "space-between", "font-size": "0.875rem", "color": "#94a3b8" }}>
-                  <span>Full Loss</span><span style={{ "color": "#34d399", "font-weight": "700" }}>{lossFull().toFixed(4)}</span>
+                  <span>Full Loss (Δ: {lossDelta >= 0 ? `-${Math.abs(lossDelta).toFixed(4)}` : `+${Math.abs(lossDelta).toFixed(4)}`})</span>
+                  <span style={{ "color": "#34d399", "font-weight": "700" }}>{lossFull().toFixed(4)}</span>
                 </div>
                 <div style={{ "width": "100%", "background-color": "#0f172a", "border-radius": "9999px", "height": "8px", "border": "1px solid #1e293b", "overflow": "hidden" }}>
                   <div style={{ "background-color": "#10b981", "height": "100%", "width": `${Math.min(100, lossFull() * 100)}%` }}></div>
@@ -739,6 +829,26 @@ export default function Home() {
                 </div>
               </div>
             </div>
+
+            {/* Live Training Sample Activity Stream */}
+            <div style={{ "background-color": "#020617", "padding": "14px", "border-radius": "6px", "border": "1px solid #1e293b", "display": "flex", "flex-direction": "column", "gap": "8px" }}>
+              <div style={{ "font-size": "0.85rem", "font-weight": "700", "color": "#38bdf8" }}>Live Training Sample Activity (Click to Infeers Seed)</div>
+              <div style={{ "display": "flex", "flex-direction": "column", "gap": "4px", "max-height": "140px", "overflow-y": "auto" }}>
+                <For each={sampleLogs()}>
+                  {(log) => (
+                    <div 
+                      onClick={() => runInference(log.tokenIds)}
+                      style={{ "display": "flex", "justify-content": "space-between", "align-items": "center", "font-size": "0.8rem", "font-family": "monospace", "color": "#cbd5e1", "background": "#0f172a", "padding": "6px 8px", "border-radius": "4px", "border": "1px solid #1e293b", "cursor": "pointer" }}
+                      title="Click to run inference using this trained sample sub-window!"
+                    >
+                      <span style={{ "overflow": "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "max-width": "70%" }}>[{log.docId}] {log.span}</span>
+                      <span style={{ "color": "#34d399", "flex-shrink": "0" }}>loss: {log.lossFull}</span>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </div>
+
           </div>
 
           <div style={cardStyle}>
@@ -769,7 +879,7 @@ export default function Home() {
               <h2 style={{ "font-size": "1.5rem", "font-weight": "700", "color": "#f8fafc", "margin": "0" }}>Inference & nanoGPT Decoding Sandbox</h2>
               <p style={{ "font-size": "0.95rem", "color": "#94a3b8", "margin": "4px 0 0 0" }}>Test generation using Temperature, Top-K, and Top-P (Nucleus) sampling</p>
             </div>
-            <button onClick={runInference} disabled={isInferring()} style={{ "padding": "12px 28px", "background-color": "#2563eb", "color": "#ffffff", "border-radius": "6px", "font-weight": "600", "font-size": "1rem", "border": "none", "cursor": "pointer" }}>
+            <button onClick={() => runInference(null)} disabled={isInferring()} style={{ "padding": "12px 28px", "background-color": "#2563eb", "color": "#ffffff", "border-radius": "6px", "font-weight": "600", "font-size": "1rem", "border": "none", "cursor": "pointer" }}>
               {isInferring() ? "Sampling..." : "Run Inference"}
             </button>
           </div>
