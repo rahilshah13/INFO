@@ -12,7 +12,7 @@ export const fetchArticleCountQuery = query(async () => {
   try {
     await fs.mkdir(VOLUME_DIR, { recursive: true });
     const files = await fs.readdir(VOLUME_DIR);
-    return files.filter(f => f.endsWith(".txt") && f !== "downloaded_ids.txt").length;
+    return files.filter(f => f.endsWith(".txt") && f !== "downloaded_ids.txt" && f !== "parsed_ids.txt").length;
   } catch {
     return 0;
   }
@@ -41,7 +41,7 @@ export const fetchArticleCorpusQuery = query(async () => {
   try {
     await fs.mkdir(VOLUME_DIR, { recursive: true });
     const files = await fs.readdir(VOLUME_DIR);
-    const txtFiles = files.filter(f => f.endsWith(".txt") && f !== "downloaded_ids.txt");
+    const txtFiles = files.filter(f => f.endsWith(".txt") && f !== "downloaded_ids.txt" && f !== "parsed_ids.txt");
     const contents = [];
     for (const file of txtFiles) {
       const raw = await fs.readFile(path.join(VOLUME_DIR, file), "utf-8");
@@ -66,6 +66,10 @@ export const fetchPrologStatsQuery = query(async () => {
         topTenWords: metrics.top_ten_words || [],
         foundPosCounts: metrics.found_pos_counts || {},
         totalPosCounts: metrics.total_pos_counts || {},
+        topTenSentenceFormats: metrics.top_ten_sentence_formats || [],
+        topTenFlatPos: metrics.top_ten_flat_pos || [],
+        avgSentenceLength: metrics.average_sentence_length || 0.0,
+        uniqueSentenceFormatsCount: metrics.unique_sentence_formats_count || 0,
         sampleEntries: metrics.top_ten_words?.map(t => `${t.word} (${t.count})`) || [],
         status: "active vocabulary"
       };
@@ -82,9 +86,9 @@ export const fetchPrologStatsQuery = query(async () => {
       raw = await fs.readFile(filePath, "utf-8");
     }
     const lines = raw.split(/\r?\n/).filter(l => l.trim().length > 0);
-    return { totalEntries: lines.length, foundVocabCount: 0, coveragePct: 0, topTenWords: [], foundPosCounts: {}, totalPosCounts: {}, sampleEntries: lines.slice(0, 5), status: "active vocabulary" };
+    return { totalEntries: lines.length, foundVocabCount: 0, coveragePct: 0, topTenWords: [], foundPosCounts: {}, totalPosCounts: {}, topTenSentenceFormats: [], topTenFlatPos: [], avgSentenceLength: 0.0, uniqueSentenceFormatsCount: 0, sampleEntries: lines.slice(0, 5), status: "active vocabulary" };
   } catch {
-    return { totalEntries: 0, foundVocabCount: 0, coveragePct: 0, topTenWords: [], foundPosCounts: {}, totalPosCounts: {}, sampleEntries: [], status: "offline" };
+    return { totalEntries: 0, foundVocabCount: 0, coveragePct: 0, topTenWords: [], foundPosCounts: {}, totalPosCounts: {}, topTenSentenceFormats: [], topTenFlatPos: [], avgSentenceLength: 0.0, uniqueSentenceFormatsCount: 0, sampleEntries: [], status: "offline" };
   }
 }, "fetchPrologStats");
 
@@ -156,9 +160,9 @@ export const fetchDaemonStatus = query(async () => {
   "use server";
   try {
     const res = await fetch("http://127.0.0.1:5000/status");
-    return res.ok ? await res.json() : { state: "IDLE", progress: 0, total: 0 };
+    return res.ok ? await res.json() : { state: "IDLE", progress: 0, total: 0, pending_articles: 0, current_sentence: "" };
   } catch {
-    return { state: "OFFLINE", progress: 0, total: 0 };
+    return { state: "OFFLINE", progress: 0, total: 0, pending_articles: 0, current_sentence: "" };
   }
 }, "daemonStatus");
 
@@ -213,11 +217,7 @@ export function multiHeadAttention(Q, K, V, numHeads = 16) {
     const headOut = V_h.ref.mul(weights.ref.toArray()[0] || 1.0);
     headOutputs.push(headOut);
 
-    Q_h.dispose();
-    K_h.dispose();
-    V_h.dispose();
-    scores.dispose();
-    weights.dispose();
+    Q_h.dispose(); K_h.dispose(); V_h.dispose(); scores.dispose(); weights.dispose();
   }
 
   const concatenated = np.concatenate(headOutputs);
@@ -225,7 +225,6 @@ export function multiHeadAttention(Q, K, V, numHeads = 16) {
   return concatenated;
 }
 
-// Vectorized batch projection transform using vmap
 const batchProject = vmap((W, x) => W.matmul(x));
 
 class ParameterStore {
@@ -339,7 +338,6 @@ export class TransformerDiffusionEncoder {
       W_denoise: random_matrix(this.target_dim, this.target_dim + 1, 0.01)
     });
 
-    // JIT compile the core encode forward pass
     this._jitEncode = jit((params, x_padded) => {
       const Q = params.W_q.ref.matmul(x_padded.ref);
       const K = params.W_k.ref.matmul(x_padded.ref);
@@ -354,21 +352,13 @@ export class TransformerDiffusionEncoder {
       const x_rec_full = params.W_rec_full.ref.matmul(z_full.ref);
       const x_rec_half = params.W_rec_half.ref.matmul(z_half.ref);
 
-      Q.dispose();
-      K.dispose();
-      V.dispose();
-      attended.dispose();
-      hidden.dispose();
-
+      Q.dispose(); K.dispose(); V.dispose(); attended.dispose(); hidden.dispose();
       return { z_full, z_half, x_rec_full, x_rec_half };
     });
   }
 
   setVocab(vocab) { if (vocab?.length) this.vocab = vocab; }
-
-  encode(params, x_padded) {
-    return this._jitEncode(params, x_padded);
-  }
+  encode(params, x_padded) { return this._jitEncode(params, x_padded); }
 
   diffusionInversionAndSample(steps = 32, samplerInstance = null, targetCompletionTokens = 16, temperature = 0.8, topK = 50, topP = 0.9, seedTokenIds = null) {
     const params = this.store.getInferenceSnapshot();
@@ -403,20 +393,6 @@ export class TransformerDiffusionEncoder {
       if (topK > 0 && topK < indexedProbs.length) {
         indexedProbs.sort((a, b) => b.p - a.p);
         indexedProbs = indexedProbs.slice(0, topK);
-        const sumP = indexedProbs.reduce((acc, item) => acc + item.p, 1e-9);
-        indexedProbs.forEach(item => item.p /= sumP);
-      } else if (topP > 0 && topP < 1.0) {
-        indexedProbs.sort((a, b) => b.p - a.p);
-        let cumSum = 0;
-        let cutIndex = indexedProbs.length;
-        for (let i = 0; i < indexedProbs.length; i++) {
-          cumSum += indexedProbs[i].p;
-          if (cumSum > topP) {
-            cutIndex = i + 1;
-            break;
-          }
-        }
-        indexedProbs = indexedProbs.slice(0, cutIndex);
         const sumP = indexedProbs.reduce((acc, item) => acc + item.p, 1e-9);
         indexedProbs.forEach(item => item.p /= sumP);
       }
@@ -466,7 +442,6 @@ export class TransformerDiffusionEncoder {
     }
 
     for (const v of Object.values(params)) v.dispose();
-
     return { seedDecoded, docId, trajectoryFull, trajectoryHalf };
   }
 
@@ -506,13 +481,7 @@ export class TransformerDiffusionEncoder {
 
     const decoded = tokensToText(zFullArr.map(v => Math.abs(Math.round((v + 1.0) * 0.5 * this.vocab.length))), this.vocab);
 
-    x_padded.dispose();
-    z_full.dispose();
-    z_half.dispose();
-    x_rec_full.dispose();
-    x_rec_half.dispose();
-    diff.dispose();
-    grad.dispose();
+    x_padded.dispose(); z_full.dispose(); z_half.dispose(); x_rec_full.dispose(); x_rec_half.dispose(); diff.dispose(); grad.dispose();
 
     return {
       loss_full: mse_full,
@@ -526,7 +495,6 @@ export class TransformerDiffusionEncoder {
 }
 
 export default function Home() {
-
   const runDaemonAction = useAction(triggerDownloadDaemon);
   const executeSaveCheckpoint = useAction(saveCheckpointAction);
 
@@ -543,6 +511,8 @@ export default function Home() {
   const [isConverging, setIsConverging] = createSignal(true);
   const [sampleLogs, setSampleLogs] = createSignal([]);
   const [downloadStatus, setDownloadStatus] = createSignal("Idle");
+  const [pendingArticlesCount, setPendingArticlesCount] = createSignal(0);
+  const [currentProcessingSentence, setCurrentProcessingSentence] = createSignal("");
   const [articleCount, setArticleCount] = createSignal(5);
   const [isPollingDaemon, setIsPollingDaemon] = createSignal(false);
 
@@ -554,20 +524,14 @@ export default function Home() {
   const [diffusionResult, setDiffusionResult] = createSignal(null);
   const [isInferring, setIsInferring] = createSignal(false);
   const [targetTokens, setTargetTokens] = createSignal(16);
-  
   const [temperature, setTemperature] = createSignal(0.8);
   const [topK, setTopK] = createSignal(50);
   const [topP, setTopP] = createSignal(0.9);
 
   const [prologStats, setPrologStats] = createSignal({ 
-    totalEntries: 0, 
-    foundVocabCount: 0, 
-    coveragePct: 0, 
-    topTenWords: [], 
-    foundPosCounts: {}, 
-    totalPosCounts: {}, 
-    sampleEntries: [], 
-    status: "loading" 
+    totalEntries: 0, foundVocabCount: 0, coveragePct: 0, 
+    topTenWords: [], foundPosCounts: {}, totalPosCounts: {}, 
+    topTenSentenceFormats: [], topTenFlatPos: [], avgSentenceLength: 0.0, uniqueSentenceFormatsCount: 0, sampleEntries: [], status: "loading" 
   });
 
   const encoder = new TransformerDiffusionEncoder(2000, 2000, vocab());
@@ -584,6 +548,13 @@ export default function Home() {
     setDocumentCount(articles.length);
     const stats = await fetchPrologStatsQuery();
     if (stats) setPrologStats(stats);
+    const statusData = await fetchDaemonStatus();
+    if (statusData.pending_articles !== undefined) {
+      setPendingArticlesCount(statusData.pending_articles);
+    }
+    if (statusData.current_sentence !== undefined) {
+      setCurrentProcessingSentence(statusData.current_sentence);
+    }
   };
 
   const refreshCheckpointList = async () => setCheckpoints(await fetchCheckpointsQuery());
@@ -619,7 +590,10 @@ export default function Home() {
     daemonPollTimer = setInterval(async () => {
       const statusData = await fetchDaemonStatus();
       if (statusData.state) {
-        setDownloadStatus(`[${statusData.state}] Processed ${statusData.progress || 0}/${statusData.total || 0}`);
+        setDownloadStatus(`[${statusData.state}] Processed ${statusData.progress || 0}/${statusData.total || 0} (Pending: ${statusData.pending_articles || 0})`);
+        if (statusData.pending_articles !== undefined) setPendingArticlesCount(statusData.pending_articles);
+        if (statusData.current_sentence !== undefined) setCurrentProcessingSentence(statusData.current_sentence);
+        await refreshData();
         if (["COMPLETED", "FAILED", "IDLE"].includes(statusData.state)) {
           await refreshData();
           if (statusData.state !== "PROCESSING") stopDaemonPolling();
@@ -695,7 +669,7 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Consolidated Top Row: Vocabulary / Prolog stats, Found Coverage Metrics & Wikipedia Downloader */}
+        {/* Consolidated Top Row: Vocabulary / Prolog stats, Sentence Format Metrics & Wikipedia Downloader */}
         <div style={cardStyle}>
           <div style={{ "display": "flex", "justify-content": "space-between", "align-items": "center", "flex-wrap": "wrap", "gap": "16px", "width": "100%" }}>
             <div style={{ "display": "flex", "align-items": "center", "gap": "16px" }}>
@@ -712,12 +686,21 @@ export default function Home() {
                 Found in Articles: <strong style={{ "color": "#34d399" }}>{prologStats().foundVocabCount}</strong> ({prologStats().coveragePct}%)
               </span>
               <span style={{ "font-size": "0.875rem", "padding": "8px 16px", "border-radius": "6px", "background-color": "#020617", "color": "#cbd5e1", "border": "1px solid #1e293b" }}>
+                Pending Analysis: <strong style={{ "color": "#f59e0b" }}>{pendingArticlesCount()}</strong>
+              </span>
+              <span style={{ "font-size": "0.875rem", "padding": "8px 16px", "border-radius": "6px", "background-color": "#020617", "color": "#cbd5e1", "border": "1px solid #1e293b" }}>
+                Unique Sentence Formats: <strong style={{ "color": "#38bdf8" }}>{prologStats().uniqueSentenceFormatsCount}</strong>
+              </span>
+              <span style={{ "font-size": "0.875rem", "padding": "8px 16px", "border-radius": "6px", "background-color": "#020617", "color": "#cbd5e1", "border": "1px solid #1e293b" }}>
+                Avg Sentence Length: <strong style={{ "color": "#38bdf8" }}>{prologStats().avgSentenceLength} words</strong>
+              </span>
+              <span style={{ "font-size": "0.875rem", "padding": "8px 16px", "border-radius": "6px", "background-color": "#020617", "color": "#cbd5e1", "border": "1px solid #1e293b" }}>
                 Document Count: <strong style={{ "color": "#ffffff" }}>{documentCount()}</strong>
               </span>
             </div>
           </div>
 
-          <div style={{ "display": "grid", "grid-template-columns": "repeat(auto-fit, minmax(350px, 1fr))", "gap": "20px", "align-items": "start", "width": "100%" }}>
+          <div style={{ "display": "grid", "grid-template-columns": "repeat(auto-fit, minmax(320px, 1fr))", "gap": "20px", "align-items": "start", "width": "100%" }}>
             
             {/* Top Ten Words Frequency Table */}
             <div style={{ "background-color": "#020617", "padding": "16px", "border-radius": "6px", "border": "1px solid #1e293b", "display": "flex", "flex-direction": "column", "gap": "10px" }}>
@@ -735,6 +718,44 @@ export default function Home() {
                 </div>
               ) : (
                 <div style={{ "font-size": "0.85rem", "color": "#64748b" }}>No word frequencies recorded yet. Run a download job!</div>
+              )}
+            </div>
+
+            {/* Top Ten Sentence Formats Table */}
+            <div style={{ "background-color": "#020617", "padding": "16px", "border-radius": "6px", "border": "1px solid #1e293b", "display": "flex", "flex-direction": "column", "gap": "10px" }}>
+              <div style={{ "font-size": "0.95rem", "font-weight": "700", "color": "#34d399" }}>Top Ten Sentence Formats (Hierarchical DCG)</div>
+              {prologStats().topTenSentenceFormats?.length > 0 ? (
+                <div style={{ "display": "flex", "flex-direction": "column", "gap": "4px", "max-height": "160px", "overflow-y": "auto" }}>
+                  <For each={prologStats().topTenSentenceFormats}>
+                    {(item) => (
+                      <div style={{ "display": "flex", "justify-content": "space-between", "font-size": "0.85rem", "font-family": "monospace", "color": "#cbd5e1", "border-bottom": "1px solid #0f172a", "padding": "2px 0" }}>
+                        <span style={{ "color": "#38bdf8", "max-width": "70%", "overflow": "hidden", "text-overflow": "ellipsis" }}>{item.format}</span>
+                        <span>{item.count} hits</span>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              ) : (
+                <div style={{ "font-size": "0.85rem", "color": "#64748b" }}>No sentence format metrics analyzed yet.</div>
+              )}
+            </div>
+
+            {/* Top Ten Sentences by Parts of Speech (Flat POS) */}
+            <div style={{ "background-color": "#020617", "padding": "16px", "border-radius": "6px", "border": "1px solid #1e293b", "display": "flex", "flex-direction": "column", "gap": "10px" }}>
+              <div style={{ "font-size": "0.95rem", "font-weight": "700", "color": "#34d399" }}>Top Ten Sentences by Parts of Speech (Flat POS)</div>
+              {prologStats().topTenFlatPos?.length > 0 ? (
+                <div style={{ "display": "flex", "flex-direction": "column", "gap": "4px", "max-height": "160px", "overflow-y": "auto" }}>
+                  <For each={prologStats().topTenFlatPos}>
+                    {(item) => (
+                      <div style={{ "display": "flex", "justify-content": "space-between", "font-size": "0.85rem", "font-family": "monospace", "color": "#cbd5e1", "border-bottom": "1px solid #0f172a", "padding": "2px 0" }}>
+                        <span style={{ "color": "#38bdf8", "max-width": "70%", "overflow": "hidden", "text-overflow": "ellipsis" }}>{item.format}</span>
+                        <span>{item.count} hits</span>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              ) : (
+                <div style={{ "font-size": "0.85rem", "color": "#64748b" }}>No flat POS metrics analyzed yet.</div>
               )}
             </div>
 
@@ -756,6 +777,14 @@ export default function Home() {
                   {downloadStatus()}
                 </div>
               </form>
+
+              {/* Live Processing Sentence View */}
+              <div style={{ "background-color": "#020617", "padding": "12px 16px", "border-radius": "6px", "border": "1px solid #1e293b", "display": "flex", "flex-direction": "column", "gap": "6px" }}>
+                <div style={{ "font-size": "0.85rem", "font-weight": "600", "color": "#34d399" }}>Currently Processing Sentence:</div>
+                <div style={{ "font-size": "0.85rem", "color": "#f8fafc", "font-family": "monospace", "background": "#0f172a", "padding": "8px", "border-radius": "4px", "border": "1px solid #1e293b", "word-break": "break-all", "max-height": "80px", "overflow-y": "auto" }}>
+                  {currentProcessingSentence() || "Idle / Waiting for task..."}
+                </div>
+              </div>
 
               <div style={{ "background-color": "#020617", "padding": "12px 16px", "border-radius": "6px", "border": "1px solid #1e293b", "display": "flex", "flex-direction": "column", "gap": "6px" }}>
                 <div style={{ "font-size": "0.85rem", "font-weight": "600", "color": "#94a3b8" }}>Live Parts of Speech Distribution (Found / Total):</div>
