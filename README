@@ -1,22 +1,4 @@
 INFO is an untyped programming language targeting signed-32-bit-floating-point tensors.
 
-### Adhere to `.gitignore` re-inclusion patterns.
-
---- 
 - Build: `docker build -t info .`
 - Run: `docker run --rm -p 3000:3000 -p 5001:5000 -v $(pwd)/volume:/info_txt_volume info`
-
----
-#### `_download_INFO.py`
-
-* **`load_words_pl_vocabulary()`**: Parses and loads target target vocabulary entries from `words.pl` into memory.
-* **`process_article_text()`**: Tokenizes article text, matches against vocabulary, and maps absolute token positions.
-* **`update_words_pl_file()`**: Safely merges and writes accumulated word locations back into the `words.pl` file structure.
-* **`get_total_size()`**: Calculates the aggregate disk usage of the output directory in gigabytes.
-* **`get_vocabulary_metrics()`**: Computes global vocabulary coverage percentages, top ten word frequencies, and part-of-speech counts.
-* **`fetch_random_article_batch()`**: Queries the Wikipedia API for a batch of random article identifiers.
-* **`fetch_page_contents_batch()`**: Retrieves raw content revisions for a batch of specified page IDs.
-* **`execute_download_job()`**: Orchestrates the background download, cleaning, parsing, and state logging loop.
-* **`DaemonHandler.do_GET()`**: Manages HTTP GET routes for status tracking, system metrics, and vocabulary file retrieval.
-* **`DaemonHandler.do_POST()`**: Manages HTTP POST routes for triggering downloads and executing Trealla Prolog queries.
-* **`run_daemon()`**: Starts the thread-safe HTTP server daemon on port 5000.
