@@ -1,4 +1,4 @@
 INFO is an untyped programming language targeting signed-32-bit-floating-point tensors.
 
 - Build: `docker build -t info .`
-- Run: `docker run --rm -p 3000:3000 -p 5001:5000 -v $(pwd)/volume:/info_txt_volume info`
+- Run: `docker run --rm -p 3001:3000 -p 5001:5000 -v $(pwd)/volume:/info_txt_volume info`
