@@ -1,8 +1,8 @@
 /*
 !.gitignore
-!/src/
-!Dockerfile
+!docker-compose.yml
 !README
 !_download_INFO.py
 !index.jsx
 !ml.js
+!/src/
